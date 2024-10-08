@@ -6,12 +6,12 @@
  */
 import {CompilerError, EnvironmentConfig} from '..';
 import {HIRFunction, IdentifierId} from '../HIR';
-import {DEFAULT_GLOBALS} from '../HIR/Globals';
+import {KNOWN_GLOBAL_OBJECT} from '../HIR/Globals';
 
 export function validateNoCapitalizedCalls(fn: HIRFunction): void {
   const envConfig: EnvironmentConfig = fn.env.config;
   const ALLOW_LIST = new Set([
-    ...DEFAULT_GLOBALS.keys(),
+    ...(fn.env.getPropertyKeys(KNOWN_GLOBAL_OBJECT) ?? []),
     ...(envConfig.validateNoCapitalizedCalls ?? []),
   ]);
   /*

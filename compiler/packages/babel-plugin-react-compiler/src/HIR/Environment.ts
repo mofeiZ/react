@@ -12,10 +12,10 @@ import {CompilerError} from '../CompilerError';
 import {Logger} from '../Entrypoint';
 import {Err, Ok, Result} from '../Utils/Result';
 import {
-  DEFAULT_GLOBALS,
   DEFAULT_SHAPES,
   Global,
-  GlobalRegistry,
+  KNOWN_GLOBAL_OBJECT,
+  KNOWN_REACT_MODULE_OBJECT,
   getReanimatedModuleType,
   installTypeConfig,
 } from './Globals';
@@ -24,6 +24,7 @@ import {
   BuiltInType,
   Effect,
   FunctionType,
+  GeneratedSource,
   HIRFunction,
   IdentifierId,
   NonLocalBinding,
@@ -40,12 +41,10 @@ import {
   makeScopeId,
 } from './HIR';
 import {
-  BuiltInMixedReadonlyId,
   DefaultMutatingHook,
   DefaultNonmutatingHook,
   FunctionSignature,
   ShapeRegistry,
-  addHook,
 } from './ObjectShape';
 import {Scope as BabelScope} from '@babel/traverse';
 import {TypeSchema} from './TypeSchema';
@@ -609,7 +608,6 @@ export function printFunctionType(type: ReactFunctionType): string {
 }
 
 export class Environment {
-  #globals: GlobalRegistry;
   #shapes: ShapeRegistry;
   #moduleTypes: Map<string, Global | null> = new Map();
   #nextIdentifer: number = 0;
@@ -649,7 +647,6 @@ export class Environment {
     this.logger = logger;
     this.useMemoCacheIdentifier = useMemoCacheIdentifier;
     this.#shapes = new Map(DEFAULT_SHAPES);
-    this.#globals = new Map(DEFAULT_GLOBALS);
     this.hasLoweredContextAccess = false;
 
     if (
@@ -664,32 +661,26 @@ export class Environment {
       });
     }
 
-    for (const [hookName, hook] of this.config.customHooks) {
-      CompilerError.invariant(!this.#globals.has(hookName), {
-        reason: `[Globals] Found existing definition in global registry for custom hook ${hookName}`,
-        description: null,
-        loc: null,
-        suggestions: null,
-      });
-      this.#globals.set(
-        hookName,
-        addHook(this.#shapes, {
-          positionalParams: [],
-          restParam: hook.effectKind,
-          returnType: hook.transitiveMixedData
-            ? {kind: 'Object', shapeId: BuiltInMixedReadonlyId}
-            : {kind: 'Poly'},
-          returnValueKind: hook.valueKind,
-          calleeEffect: Effect.Read,
-          hookKind: 'Custom',
-          noAlias: hook.noAlias,
-        }),
-      );
-    }
-
     if (config.enableCustomTypeDefinitionForReanimated) {
+      if (this.config.moduleTypeProvider?.(REANIMATED_MODULE_NAME) != null) {
+        CompilerError.throwInvalidConfig({
+          reason: `Invalid environment config: enableCustomTypeDefinitionForReanimated and moduleTypeProvider for ${REANIMATED_MODULE_NAME} conflicts.`,
+          loc: GeneratedSource,
+        });
+      }
       const reanimatedModuleType = getReanimatedModuleType(this.#shapes);
       this.#moduleTypes.set(REANIMATED_MODULE_NAME, reanimatedModuleType);
+    }
+    for (const knownReactModule of KNOWN_REACT_MODULES) {
+      if (this.config.moduleTypeProvider?.(knownReactModule) != null) {
+        CompilerError.throwInvalidConfig({
+          reason:
+            'Invalid environment config: moduleTypeProvider should not return a type definition for known react module.',
+          description: `Module named ${knownReactModule}`,
+          loc: GeneratedSource,
+        });
+      }
+      this.#moduleTypes.set(knownReactModule, KNOWN_REACT_MODULE_OBJECT);
     }
 
     this.#contextIdentifiers = contextIdentifiers;
@@ -752,7 +743,6 @@ export class Environment {
         }
         const moduleConfig = parsedModuleConfig.data;
         moduleType = installTypeConfig(
-          this.#globals,
           this.#shapes,
           moduleConfig,
           moduleName,
@@ -778,7 +768,10 @@ export class Environment {
         isHookName(match[1])
       ) {
         const resolvedName = match[1];
-        return this.#globals.get(resolvedName) ?? this.#getCustomHookType();
+        return (
+          this.getPropertyType(KNOWN_REACT_MODULE_OBJECT, resolvedName) ??
+          this.#getCustomHookType()
+        );
       }
     }
 
@@ -789,111 +782,105 @@ export class Environment {
       }
       case 'Global': {
         return (
-          this.#globals.get(binding.name) ??
+          this.getPropertyType(KNOWN_GLOBAL_OBJECT, binding.name) ??
           (isHookName(binding.name) ? this.#getCustomHookType() : null)
         );
       }
       case 'ImportSpecifier': {
-        if (this.#isKnownReactModule(binding.module)) {
-          /**
-           * For `import {imported as name} from "..."` form, we use the `imported`
-           * name rather than the local alias. Because we don't have definitions for
-           * every React builtin hook yet, we also check to see if the imported name
-           * is hook-like (whereas the fall-through below is checking if the aliased
-           * name is hook-like)
-           */
-          return (
-            this.#globals.get(binding.imported) ??
-            (isHookName(binding.imported) ? this.#getCustomHookType() : null)
+        const moduleType = this.#resolveModuleType(binding.module, loc);
+        if (moduleType !== null) {
+          const importedType = this.getPropertyType(
+            moduleType,
+            binding.imported,
           );
-        } else {
-          const moduleType = this.#resolveModuleType(binding.module, loc);
-          if (moduleType !== null) {
-            const importedType = this.getPropertyType(
-              moduleType,
-              binding.imported,
-            );
-            if (importedType != null) {
-              /*
-               * Check that hook-like export names are hook types, and non-hook names are non-hook types.
-               * The user-assigned alias isn't decidable by the type provider, so we ignore that for the check.
-               * Thus we allow `import {fooNonHook as useFoo} from ...` because the name and type both say
-               * that it's not a hook.
-               */
-              const expectHook = isHookName(binding.imported);
-              const isHook = getHookKindForType(this, importedType) != null;
-              if (expectHook !== isHook) {
-                CompilerError.throwInvalidConfig({
-                  reason: `Invalid type configuration for module`,
-                  description: `Expected type for \`import {${binding.imported}} from '${binding.module}'\` ${expectHook ? 'to be a hook' : 'not to be a hook'} based on the exported name`,
-                  loc,
-                });
-              }
-              return importedType;
+          if (importedType != null) {
+            /*
+             * Check that hook-like export names are hook types, and non-hook names are non-hook types.
+             * The user-assigned alias isn't decidable by the type provider, so we ignore that for the check.
+             * Thus we allow `import {fooNonHook as useFoo} from ...` because the name and type both say
+             * that it's not a hook.
+             */
+            const expectHook = isHookName(binding.imported);
+            const isHook = getHookKindForType(this, importedType) != null;
+            if (expectHook !== isHook) {
+              CompilerError.throwInvalidConfig({
+                reason: `Invalid type configuration for module`,
+                description: `Expected type for \`import {${binding.imported}} from '${binding.module}'\` ${expectHook ? 'to be a hook' : 'not to be a hook'} based on the exported name`,
+                loc,
+              });
             }
+            return importedType;
           }
-
-          /**
-           * For modules we don't own, we look at whether the original name or import alias
-           * are hook-like. Both of the following are likely hooks so we would return a hook
-           * type for both:
-           *
-           * `import {useHook as foo} ...`
-           * `import {foo as useHook} ...`
-           */
-          return isHookName(binding.imported) || isHookName(binding.name)
-            ? this.#getCustomHookType()
-            : null;
         }
+
+        /**
+         * For modules we don't own, we look at whether the original name or import alias
+         * are hook-like. Both of the following are likely hooks so we would return a hook
+         * type for both:
+         *
+         * `import {useHook as foo} ...`
+         * `import {foo as useHook} ...`
+         */
+        return isHookName(binding.imported) || isHookName(binding.name)
+          ? this.#getCustomHookType()
+          : null;
       }
       case 'ImportDefault':
       case 'ImportNamespace': {
-        if (this.#isKnownReactModule(binding.module)) {
-          // only resolve imports to modules we know about
-          return (
-            this.#globals.get(binding.name) ??
-            (isHookName(binding.name) ? this.#getCustomHookType() : null)
-          );
-        } else {
-          const moduleType = this.#resolveModuleType(binding.module, loc);
-          if (moduleType !== null) {
-            let importedType: Type | null = null;
-            if (binding.kind === 'ImportDefault') {
-              const defaultType = this.getPropertyType(moduleType, 'default');
-              if (defaultType !== null) {
-                importedType = defaultType;
-              }
-            } else {
-              importedType = moduleType;
+        const moduleType = this.#resolveModuleType(binding.module, loc);
+        if (moduleType !== null) {
+          let importedType: Type | null = null;
+          if (binding.kind === 'ImportDefault') {
+            const defaultType = this.getPropertyType(moduleType, 'default');
+            if (defaultType !== null) {
+              importedType = defaultType;
             }
-            if (importedType !== null) {
-              /*
-               * Check that the hook-like modules are defined as types, and non hook-like modules are not typed as hooks.
-               * So `import Foo from 'useFoo'` is expected to be a hook based on the module name
-               */
-              const expectHook = isHookName(binding.module);
-              const isHook = getHookKindForType(this, importedType) != null;
-              if (expectHook !== isHook) {
-                CompilerError.throwInvalidConfig({
-                  reason: `Invalid type configuration for module`,
-                  description: `Expected type for \`import ... from '${binding.module}'\` ${expectHook ? 'to be a hook' : 'not to be a hook'} based on the module name`,
-                  loc,
-                });
-              }
-              return importedType;
-            }
+          } else {
+            importedType = moduleType;
           }
-          return isHookName(binding.name) ? this.#getCustomHookType() : null;
+          if (importedType !== null) {
+            /*
+             * Check that the hook-like modules are defined as types, and non hook-like modules are not typed as hooks.
+             * So `import Foo from 'useFoo'` is expected to be a hook based on the module name
+             */
+            const expectHook = isHookName(binding.module);
+            const isHook = getHookKindForType(this, importedType) != null;
+            if (expectHook !== isHook) {
+              CompilerError.throwInvalidConfig({
+                reason: `Invalid type configuration for module`,
+                description: `Expected type for \`import ... from '${binding.module}'\` ${expectHook ? 'to be a hook' : 'not to be a hook'} based on the module name`,
+                loc,
+              });
+            }
+            return importedType;
+          }
         }
+        return isHookName(binding.name) ? this.#getCustomHookType() : null;
       }
     }
   }
 
-  #isKnownReactModule(moduleName: string): boolean {
-    return (
-      moduleName.toLowerCase() === 'react' ||
-      moduleName.toLowerCase() === 'react-dom'
-    );
+  getPropertyKeys(receiver: Type): Iterable<string> | null {
+    let shapeId = null;
+    if (receiver.kind === 'Object' || receiver.kind === 'Function') {
+      shapeId = receiver.shapeId;
+    }
+
+    if (shapeId !== null) {
+      /*
+       * If an object or function has a shapeId, it must have been assigned
+       * by Forget (and be present in a builtin or user-defined registry)
+       */
+      const shape = this.#shapes.get(shapeId);
+      CompilerError.invariant(shape !== undefined, {
+        reason: `[HIR] Forget internal error: cannot resolve shape ${shapeId}`,
+        description: null,
+        loc: null,
+        suggestions: null,
+      });
+      return shape.properties.keys();
+    }
+    return null;
   }
 
   getPropertyType(
@@ -959,6 +946,7 @@ export class Environment {
 }
 
 const REANIMATED_MODULE_NAME = 'react-native-reanimated';
+const KNOWN_REACT_MODULES = ['react', 'React', 'react-dom'];
 
 // From https://github.com/facebook/react/blob/main/packages/eslint-plugin-react-hooks/src/RulesOfHooks.js#LL18C1-L23C2
 export function isHookName(name: string): boolean {

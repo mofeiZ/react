@@ -468,47 +468,8 @@ const REACT_APIS: Array<[string, BuiltInType]> = [
       BuiltInUseOperatorId,
     ),
   ],
-];
-
-TYPED_GLOBALS.push(
   [
-    'React',
-    addObject(DEFAULT_SHAPES, null, [
-      ...REACT_APIS,
-      [
-        'createElement',
-        addFunction(DEFAULT_SHAPES, [], {
-          positionalParams: [],
-          restParam: Effect.Freeze,
-          returnType: {kind: 'Poly'},
-          calleeEffect: Effect.Read,
-          returnValueKind: ValueKind.Frozen,
-        }),
-      ],
-      [
-        'cloneElement',
-        addFunction(DEFAULT_SHAPES, [], {
-          positionalParams: [],
-          restParam: Effect.Freeze,
-          returnType: {kind: 'Poly'},
-          calleeEffect: Effect.Read,
-          returnValueKind: ValueKind.Frozen,
-        }),
-      ],
-      [
-        'createRef',
-        addFunction(DEFAULT_SHAPES, [], {
-          positionalParams: [],
-          restParam: Effect.Capture, // createRef takes no paramters
-          returnType: {kind: 'Object', shapeId: BuiltInUseRefId},
-          calleeEffect: Effect.Read,
-          returnValueKind: ValueKind.Mutable,
-        }),
-      ],
-    ]),
-  ],
-  [
-    '_jsx',
+    'createElement',
     addFunction(DEFAULT_SHAPES, [], {
       positionalParams: [],
       restParam: Effect.Freeze,
@@ -517,35 +478,74 @@ TYPED_GLOBALS.push(
       returnValueKind: ValueKind.Frozen,
     }),
   ],
-);
+  [
+    'cloneElement',
+    addFunction(DEFAULT_SHAPES, [], {
+      positionalParams: [],
+      restParam: Effect.Freeze,
+      returnType: {kind: 'Poly'},
+      calleeEffect: Effect.Read,
+      returnValueKind: ValueKind.Frozen,
+    }),
+  ],
+  [
+    'createRef',
+    addFunction(DEFAULT_SHAPES, [], {
+      positionalParams: [],
+      restParam: Effect.Capture, // createRef takes no paramters
+      returnType: {kind: 'Object', shapeId: BuiltInUseRefId},
+      calleeEffect: Effect.Read,
+      returnValueKind: ValueKind.Mutable,
+    }),
+  ],
+];
+
+TYPED_GLOBALS.push([
+  '_jsx',
+  addFunction(DEFAULT_SHAPES, [], {
+    positionalParams: [],
+    restParam: Effect.Freeze,
+    returnType: {kind: 'Poly'},
+    calleeEffect: Effect.Read,
+    returnValueKind: ValueKind.Frozen,
+  }),
+]);
 
 export type Global = BuiltInType | PolyType;
-export type GlobalRegistry = Map<string, Global>;
-export const DEFAULT_GLOBALS: GlobalRegistry = new Map(REACT_APIS);
+const KNOWN_REACT_EXPORTS_OBJECT = addObject(DEFAULT_SHAPES, null, REACT_APIS);
+export const KNOWN_REACT_MODULE_OBJECT: ObjectType = addObject(
+  DEFAULT_SHAPES,
+  null,
+  [...REACT_APIS, ['default', KNOWN_REACT_EXPORTS_OBJECT]],
+);
 
-// Hack until we add ObjectShapes for all globals
-for (const name of UNTYPED_GLOBALS) {
-  DEFAULT_GLOBALS.set(name, {
-    kind: 'Poly',
-  });
-}
-
-for (const [name, type_] of TYPED_GLOBALS) {
-  DEFAULT_GLOBALS.set(name, type_);
-}
+export const KNOWN_GLOBAL_OBJECT: ObjectType = addObject(DEFAULT_SHAPES, null, [
+  // Hack until we add ObjectShapes for all globals
+  ...Array.from(UNTYPED_GLOBALS).map(
+    name => [name, {kind: 'Poly'}] as [string, Global],
+  ),
+  ...TYPED_GLOBALS,
+  /**
+   * React library functions are not in the global object, but many of our unit
+   * tests and playground users call these without importing from react.
+   * Realistically, this doesn't seem to be an issue as reading unbound
+   * identifiers would fail anyways in strict mode.
+   */
+  ...REACT_APIS,
+  ['React', KNOWN_REACT_EXPORTS_OBJECT],
+]);
 
 // Recursive global types
-DEFAULT_GLOBALS.set(
-  'globalThis',
-  addObject(DEFAULT_SHAPES, 'globalThis', TYPED_GLOBALS),
-);
-DEFAULT_GLOBALS.set(
+DEFAULT_SHAPES.get(KNOWN_GLOBAL_OBJECT.shapeId!)!.properties.set(
   'global',
-  addObject(DEFAULT_SHAPES, 'global', TYPED_GLOBALS),
+  KNOWN_GLOBAL_OBJECT,
+);
+DEFAULT_SHAPES.get(KNOWN_GLOBAL_OBJECT.shapeId!)!.properties.set(
+  'globalThis',
+  KNOWN_GLOBAL_OBJECT,
 );
 
 export function installTypeConfig(
-  globals: GlobalRegistry,
   shapes: ShapeRegistry,
   typeConfig: TypeConfig,
   moduleName: string,
@@ -583,7 +583,6 @@ export function installTypeConfig(
         restParam: typeConfig.restParam,
         calleeEffect: typeConfig.calleeEffect,
         returnType: installTypeConfig(
-          globals,
           shapes,
           typeConfig.returnType,
           moduleName,
@@ -602,7 +601,6 @@ export function installTypeConfig(
         restParam: typeConfig.restParam ?? Effect.Freeze,
         calleeEffect: Effect.Read,
         returnType: installTypeConfig(
-          globals,
           shapes,
           typeConfig.returnType,
           moduleName,
@@ -617,13 +615,7 @@ export function installTypeConfig(
         shapes,
         null,
         Object.entries(typeConfig.properties ?? {}).map(([key, value]) => {
-          const type = installTypeConfig(
-            globals,
-            shapes,
-            value,
-            moduleName,
-            loc,
-          );
+          const type = installTypeConfig(shapes, value, moduleName, loc);
           const expectHook = isHookName(key);
           let isHook = false;
           if (type.kind === 'Function' && type.shapeId !== null) {
